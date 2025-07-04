@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-import argparse
-import sys
-import time
-import re
-import configparser
+"""msfwrap.py – Send Meterpreter **or** shell commands over msgrpc with cached creds.
+
+Highlights
+==========
+* Caches RPC creds in `.msfwrap.env` (ini style).
+* Picks newest session if `-s` not supplied.
+* **Meterpreter sessions:** uses `runsingle()` + buffered reader (`mrun`) that
+  waits for the prompt so you always get full output (even for `ps`, `hashdump`, …).
+* **Shell sessions:** falls back to `run_with_output()`; otherwise `write()`/`read()`.
+"""
+import argparse, sys, time, re, configparser
 from pathlib import Path
 from pymetasploit3.msfrpc import MsfRpcClient, MsfError
 
 ENV_FILE = Path('.msfwrap.env')
-ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  
-PROMPT = 'meterpreter >'
-
+ANSI     = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # strip colour codes
+PROMPT   = 'meterpreter >'
 
 def eprint(*a, **kw):
     print(*a, file=sys.stderr, **kw)
 
+###############################################################################
+# Cred helpers
+###############################################################################
 
 def load_cfg():
     cfg = configparser.ConfigParser()
@@ -23,28 +31,43 @@ def load_cfg():
         return cfg['msf']
     return {}
 
-
 def save_cfg(d):
-    cfg = configparser.ConfigParser()
-    cfg['msf'] = d
+    cfg = configparser.ConfigParser(); cfg['msf'] = d
     with ENV_FILE.open('w', encoding='utf-8') as f:
         cfg.write(f)
     eprint(f"[+] Saved config to {ENV_FILE}")
 
+###############################################################################
+# Meterpreter buffered runner
+###############################################################################
 
 def mrun(session, cmd, prompt=PROMPT, timeout=10.0, poll=0.15):
-    """Reliable Meterpreter command runner that waits for the prompt."""
+    """Reliable Meterpreter command runner that waits for the prompt.
+
+    * Captures the **initial return value** from `runsingle()`, which often
+      contains all output for quick commands like `pwd`/`getuid`.
+    * Continues polling `session.read()` until it sees the prompt or hits the
+      timeout, allowing long outputs (`ps`, `dir`, etc.) to be collected.
+    """
+    # 1. Drain leftovers
     while session.read():
         pass
 
-        session.runsingle(cmd)
+    # 2. Queue command and capture immediate chunk
+    first = session.runsingle(cmd) or ''
+    buf   = [first]
+    if prompt in first:
+        # got everything from first call
+        output = first.split(prompt, 1)[0]
+        return ANSI.sub('', output).rstrip()
 
-    buf, start = [], time.time()
+    # 3. Poll ring until prompt or timeout
+    start = time.time()
     while time.time() - start < timeout:
         chunk = session.read()
         if chunk:
             buf.append(chunk)
-            if prompt in ''.join(buf):
+            if prompt in chunk:
                 break
         else:
             time.sleep(poll)
@@ -54,24 +77,25 @@ def mrun(session, cmd, prompt=PROMPT, timeout=10.0, poll=0.15):
         output = output.split(prompt, 1)[0]
     return ANSI.sub('', output).rstrip()
 
+###############################################################################
+# CLI
+###############################################################################
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description='Send Meterpreter commands via msgrpc with persistent config.')
+    p = argparse.ArgumentParser(description='Send Meterpreter commands via msgrpc with persistent config.')
     p.add_argument('-H', '--host', help='RPC server address')
     p.add_argument('-P', '--port', type=int, help='RPC port')
     p.add_argument('-u', '--user', help='RPC username')
     p.add_argument('-p', '--password', help='RPC password')
-    p.add_argument('-s', '--session', type=int,
-                   help='Session ID to use (default newest)')
-    p.add_argument('--timeout', type=float,
-                   default=10.0, help='Read timeout (s)')
-    p.add_argument('--poll', type=float, default=0.15,
-                   help='Poll interval when reading (s)')
-    p.add_argument('commands', nargs='*',
-                   help='Meterpreter commands (quote them)')
+    p.add_argument('-s', '--session', type=int, help='Session ID to use (default newest)')
+    p.add_argument('--timeout', type=float, default=10.0, help='Read timeout (s)')
+    p.add_argument('--poll', type=float, default=0.15, help='Poll interval when reading (s)')
+    p.add_argument('commands', nargs='*', help='Meterpreter commands (quote them)')
     return p.parse_args()
 
+###############################################################################
+# Main
+###############################################################################
 
 def main():
     a = parse_args()
@@ -80,16 +104,14 @@ def main():
     host = a.host or cfg.get('host', '127.0.0.1')
     port = a.port or int(cfg.get('port', '55555'))
     user = a.user or cfg.get('user', 'python')
-    pw = a.password or cfg.get('password')
+    pw   = a.password or cfg.get('password')
     if pw is None:
         pw = input('RPC password: ')
-        save_cfg({'host': host, 'port': str(port),
-                 'user': user, 'password': pw})
+        save_cfg({'host': host, 'port': str(port), 'user': user, 'password': pw})
 
     eprint(f"[*] Connecting to {host}:{port} as {user}")
     try:
-        client = MsfRpcClient(password=pw, username=user,
-                              port=port, server=host, ssl=False)
+        client = MsfRpcClient(password=pw, username=user, port=port, server=host, ssl=False)
     except Exception as e:
         eprint(f"[!] Failed to connect/authenticate: {e}")
         sys.exit(1)
@@ -98,19 +120,17 @@ def main():
         eprint('[-] No active sessions.')
         sys.exit(1)
 
-    sid = str(a.session) if a.session is not None else max(
-        client.sessions.list, key=lambda s: int(s))
+    sid = str(a.session) if a.session is not None else max(client.sessions.list, key=lambda s: int(s))
     if sid not in client.sessions.list:
         eprint(f'[-] Session {sid} not found.')
         sys.exit(1)
 
     session = client.sessions.session(sid)
-    info = client.sessions.list[sid]
+    info    = client.sessions.list[sid]
     is_meterp = info['type'] == 'meterpreter'
     eprint(f"[+] Using session {sid} ({info['type']}, {info['info']})")
 
-    cmds = a.commands or (
-        [l.strip() for l in sys.stdin if l.strip()] if not sys.stdin.isatty() else [])
+    cmds = a.commands or ([l.strip() for l in sys.stdin if l.strip()] if not sys.stdin.isatty() else [])
     if not cmds:
         eprint('[-] No commands provided.')
         sys.exit(1)
@@ -132,3 +152,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

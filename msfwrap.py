@@ -1,154 +1,112 @@
 #!/usr/bin/env python3
-"""msfwrap.py – Send Meterpreter **or** shell commands over msgrpc with cached creds.
-
-Highlights
-==========
-* Caches RPC creds in `.msfwrap.env` (ini style).
-* Picks newest session if `-s` not supplied.
-* **Meterpreter sessions:** uses `runsingle()` + buffered reader (`mrun`) that
-  waits for the prompt so you always get full output (even for `ps`, `hashdump`, …).
-* **Shell sessions:** falls back to `run_with_output()`; otherwise `write()`/`read()`.
-"""
+"""msfwrap.py – Execute Metasploit console commands via RPC and print output."""
 import argparse, sys, time, re, configparser
 from pathlib import Path
 from pymetasploit3.msfrpc import MsfRpcClient, MsfError
 
+# Configuration
 ENV_FILE = Path('.msfwrap.env')
-ANSI     = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # strip colour codes
-PROMPT   = 'meterpreter >'
+ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+PROMPT = 'meterpreter >'
 
-def eprint(*a, **kw):
-    print(*a, file=sys.stderr, **kw)
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
-###############################################################################
-# Cred helpers
-###############################################################################
-
-def load_cfg():
+def load_config():
     cfg = configparser.ConfigParser()
-    if ENV_FILE.exists() and cfg.read(ENV_FILE) and 'msf' in cfg:
-        eprint(f"[*] Loaded config from {ENV_FILE}")
-        return cfg['msf']
+    if ENV_FILE.exists():
+        cfg.read(ENV_FILE)
+        if 'msf' in cfg:
+            eprint(f"[*] Loaded config from {ENV_FILE}")
+            return cfg['msf']
     return {}
 
-def save_cfg(d):
-    cfg = configparser.ConfigParser(); cfg['msf'] = d
+def save_config(data):
+    cfg = configparser.ConfigParser(); cfg['msf'] = data
     with ENV_FILE.open('w', encoding='utf-8') as f:
         cfg.write(f)
     eprint(f"[+] Saved config to {ENV_FILE}")
 
-###############################################################################
-# Meterpreter buffered runner
-###############################################################################
-
-def mrun(session, cmd, prompt=PROMPT, timeout=10.0, poll=0.15):
-    """Reliable Meterpreter command runner that waits for the prompt.
-
-    * Captures the **initial return value** from `runsingle()`, which often
-      contains all output for quick commands like `pwd`/`getuid`.
-    * Continues polling `session.read()` until it sees the prompt or hits the
-      timeout, allowing long outputs (`ps`, `dir`, etc.) to be collected.
-    """
-    # 1. Drain leftovers
-    while session.read():
-        pass
-
-    # 2. Queue command and capture immediate chunk
-    first = session.runsingle(cmd) or ''
-    buf   = [first]
-    if prompt in first:
-        # got everything from first call
-        output = first.split(prompt, 1)[0]
-        return ANSI.sub('', output).rstrip()
-
-    # 3. Poll ring until prompt or timeout
-    start = time.time()
-    while time.time() - start < timeout:
-        chunk = session.read()
-        if chunk:
-            buf.append(chunk)
-            if prompt in chunk:
-                break
-        else:
-            time.sleep(poll)
-
-    output = ''.join(buf)
-    if prompt in output:
-        output = output.split(prompt, 1)[0]
-    return ANSI.sub('', output).rstrip()
-
-###############################################################################
-# CLI
-###############################################################################
+# Argument parser
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Send Meterpreter commands via msgrpc with persistent config.')
-    p.add_argument('-H', '--host', help='RPC server address')
-    p.add_argument('-P', '--port', type=int, help='RPC port')
-    p.add_argument('-u', '--user', help='RPC username')
-    p.add_argument('-p', '--password', help='RPC password')
-    p.add_argument('-s', '--session', type=int, help='Session ID to use (default newest)')
-    p.add_argument('--timeout', type=float, default=10.0, help='Read timeout (s)')
-    p.add_argument('--poll', type=float, default=0.15, help='Poll interval when reading (s)')
-    p.add_argument('commands', nargs='*', help='Meterpreter commands (quote them)')
+    p = argparse.ArgumentParser(
+        description="msfwrap: run Metasploit console commands via RPC"
+    )
+    p.add_argument('-H','--host',help="RPC host")
+    p.add_argument('-P','--port',type=int,help="RPC port")
+    p.add_argument('-u','--user',help="RPC user")
+    p.add_argument('-p','--password',help="RPC password")
+    p.add_argument('-q','--quiet',action='store_true',help="suppress banner")
+    p.add_argument('--timeout',type=float,default=10.0,help="read timeout (s)")
+    p.add_argument('--poll',type=float,default=0.15,help="read poll interval (s)")
+    p.add_argument('commands',nargs='*',help="commands to run (e.g. 'sessions')")
     return p.parse_args()
 
-###############################################################################
-# Main
-###############################################################################
+# RPC console flow
 
-def main():
-    a = parse_args()
-    cfg = load_cfg()
-
-    host = a.host or cfg.get('host', '127.0.0.1')
-    port = a.port or int(cfg.get('port', '55555'))
-    user = a.user or cfg.get('user', 'python')
-    pw   = a.password or cfg.get('password')
-    if pw is None:
-        pw = input('RPC password: ')
-        save_cfg({'host': host, 'port': str(port), 'user': user, 'password': pw})
-
-    eprint(f"[*] Connecting to {host}:{port} as {user}")
-    try:
-        client = MsfRpcClient(password=pw, username=user, port=port, server=host, ssl=False)
-    except Exception as e:
-        eprint(f"[!] Failed to connect/authenticate: {e}")
-        sys.exit(1)
-
-    if not client.sessions.list:
-        eprint('[-] No active sessions.')
-        sys.exit(1)
-
-    sid = str(a.session) if a.session is not None else max(client.sessions.list, key=lambda s: int(s))
-    if sid not in client.sessions.list:
-        eprint(f'[-] Session {sid} not found.')
-        sys.exit(1)
-
-    session = client.sessions.session(sid)
-    info    = client.sessions.list[sid]
-    is_meterp = info['type'] == 'meterpreter'
-    eprint(f"[+] Using session {sid} ({info['type']}, {info['info']})")
-
-    cmds = a.commands or ([l.strip() for l in sys.stdin if l.strip()] if not sys.stdin.isatty() else [])
-    if not cmds:
-        eprint('[-] No commands provided.')
-        sys.exit(1)
-
-    for cmd in cmds:
-        eprint(f"[>] {cmd}")
-        try:
-            if is_meterp:
-                output = mrun(session, cmd, timeout=a.timeout, poll=a.poll)
+def console_flow(client, cmds, quiet, timeout, poll):
+    console = client.consoles.console()
+    if not quiet:
+        eprint(f"[+] Opened RPC console {console.cid}")
+    # drain banner
+    if quiet:
+        while True:
+            r = console.read()
+            if not r or (isinstance(r, dict) and not r.get('data')):
+                break
+    out = ''
+    for c in cmds:
+        if not quiet:
+            eprint(f"msf> {c}")
+        console.write(c + '\n')
+        start = time.time()
+        while time.time() - start < timeout:
+            r = console.read()
+            if isinstance(r, dict):
+                out += r.get('data','')
+                if not r.get('busy', True):
+                    break
             else:
-                output = session.run_with_output(cmd, timeout=a.timeout)
-        except (AttributeError, MsfError):
-            session.write(cmd + '\n')
-            time.sleep(a.poll)
-            output = session.read() or '[!] No output returned'
+                if not r:
+                    break
+                out += r
+            time.sleep(poll)
+    console.destroy()
+    print(out.strip())
+    if not quiet:
+        eprint(f"[+] RPC console closed")
 
-        print(output or '[!] No output returned')
-
+# Main function
+def main():
+    args = parse_args()
+    cfg = load_config()
+    host = args.host or cfg.get('host')
+    port = args.port or (int(cfg.get('port')) if cfg.get('port','').isdigit() else None)
+    user = args.user or cfg.get('user')
+    pwd  = args.password or cfg.get('password')
+    if not all([host, port, user, pwd]):
+        eprint('[!] Missing RPC credentials; please enter:')
+        if not host:
+            host = input('RPC host [127.0.0.1]: ') or '127.0.0.1'
+        if not port:
+            while True:
+                v = input('RPC port [55555]: ') or '55555'
+                if v.isdigit():
+                    port = int(v)
+                    break
+                eprint('Invalid port')
+        if not user:
+            user = input('RPC user [python]: ') or 'python'
+        if not pwd:
+            pwd = input('RPC password: ')
+        save_config({'host':host,'port':str(port),'user':user,'password':pwd})
+    eprint(f"[*] Connecting to {host}:{port} as {user}")
+    client = MsfRpcClient(password=pwd, username=user, port=port, server=host, ssl=False)
+    # If no commands, exit
+    if not args.commands:
+        eprint('[-] No commands provided.'); sys.exit(1)
+    console_flow(client, args.commands, args.quiet, args.timeout, args.poll)
 
 if __name__ == '__main__':
     main()
